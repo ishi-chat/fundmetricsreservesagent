@@ -1,9 +1,9 @@
 // Vercel serverless function at repo root (chat.js), routed to POST /chat.
-// The OpenAI key lives in the OPENAI_API_KEY env var and never reaches the browser.
+// The Anthropic key lives in ANTHROPIC_API_KEY and never reaches the browser.
 // All arithmetic runs in runReservesCheck / runFundMetrics - deterministic,
 // never left to the model.
 
-const MODEL = process.env.MODEL || "gpt-5.6-luna";
+const MODEL = process.env.MODEL || "claude-haiku-4-5";
 const MAX_TURNS = 24; // max messages accepted from the client
 const MAX_CHARS = 4000; // per message
 const MAX_TOOL_LOOPS = 3;
@@ -68,12 +68,10 @@ HARD LIMITS:
 - Keep answers under roughly 350 words unless the user asks for depth.`;
 
 const TOOL_DEF = {
-  type: "function",
-  function: {
-    name: "run_reserves_check",
-    description:
-      "Deterministically compute follow-on capacity vs implied reserve need and allocate capacity in rank order. Omit 'book' to use the built-in synthetic demo book.",
-    parameters: {
+  name: "run_reserves_check",
+  description:
+    "Deterministically compute follow-on capacity vs implied reserve need and allocate capacity in rank order. Omit 'book' to use the built-in synthetic demo book.",
+  input_schema: {
       type: "object",
       properties: {
         book: {
@@ -112,7 +110,6 @@ const TOOL_DEF = {
         },
       },
     },
-  },
 };
 
 function runReservesCheck(args) {
@@ -203,12 +200,10 @@ const DEFAULT_FLOWS = {
 };
 
 const METRICS_TOOL_DEF = {
-  type: "function",
-  function: {
-    name: "run_fund_metrics",
-    description:
-      "Deterministically compute DPI, RVPI, TVPI and XIRR from dated cashflows (Call negative, Distribution positive, NAV terminal inflow) and return an eight-line IC note. Omit 'book' to use the built-in synthetic demo (paid-in 60, distributed 20, NAV 70).",
-    parameters: {
+  name: "run_fund_metrics",
+  description:
+    "Deterministically compute DPI, RVPI, TVPI and XIRR from dated cashflows (Call negative, Distribution positive, NAV terminal inflow) and return an eight-line IC note. Omit 'book' to use the built-in synthetic demo (paid-in 60, distributed 20, NAV 70).",
+  input_schema: {
       type: "object",
       properties: {
         book: {
@@ -234,7 +229,6 @@ const METRICS_TOOL_DEF = {
         },
       },
     },
-  },
 };
 
 function xirr(pairs) {
@@ -346,8 +340,6 @@ function runFundMetrics(args) {
 
 export { runReservesCheck, runFundMetrics }; // exported for testing
 
-// Best-effort per-instance rate limit (serverless instances reset, so this
-// is a speed bump, not a wall; the real cap is the OpenAI budget limit).
 const hits = new Map();
 function rateLimited(ip) {
   const now = Date.now();
@@ -359,12 +351,41 @@ function rateLimited(ip) {
   return false;
 }
 
+function toAnthropicMessages(clientMessages) {
+  const out = [];
+  for (const m of clientMessages) {
+    if (out.length && out[out.length - 1].role === m.role) {
+      out[out.length - 1].content += "\n" + m.content;
+    } else {
+      out.push({ role: m.role, content: m.content });
+    }
+  }
+  if (out.length && out[0].role === "assistant") {
+    out.unshift({ role: "user", content: "(continue)" });
+  }
+  return out;
+}
+
+function textFromClaude(content) {
+  return (content || [])
+    .filter((b) => b.type === "text" && b.text)
+    .map((b) => b.text)
+    .join("\n")
+    .trim();
+}
+
+function runNamedTool(name, input) {
+  if (name === "run_fund_metrics") return runFundMetrics(input || {});
+  if (name === "run_reserves_check") return runReservesCheck(input || {});
+  return { error: "Unknown tool: " + name };
+}
+
 export default async function handler(req, res) {
   if (req.method !== "POST") {
     return res.status(405).json({ error: "POST only" });
   }
-  if (!process.env.OPENAI_API_KEY) {
-    return res.status(500).json({ error: "Server missing OPENAI_API_KEY" });
+  if (!process.env.ANTHROPIC_API_KEY) {
+    return res.status(500).json({ error: "Server missing ANTHROPIC_API_KEY" });
   }
 
   const ip =
@@ -390,65 +411,62 @@ export default async function handler(req, res) {
     )
     .map((m) => ({ role: m.role, content: m.content.slice(0, MAX_CHARS) }));
 
-  const convo = [{ role: "system", content: SYSTEM_PROMPT }, ...messages];
+  const convo = toAnthropicMessages(messages);
 
   try {
     for (let loop = 0; loop <= MAX_TOOL_LOOPS; loop++) {
-      const resp = await fetch("https://api.openai.com/v1/chat/completions", {
+      const resp = await fetch("https://api.anthropic.com/v1/messages", {
         method: "POST",
         headers: {
-          Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
+          "x-api-key": process.env.ANTHROPIC_API_KEY,
+          "anthropic-version": "2023-06-01",
           "Content-Type": "application/json",
         },
         body: JSON.stringify({
           model: MODEL,
-          messages: convo,
-          tools: [TOOL_DEF, METRICS_TOOL_DEF],
           max_tokens: 800,
           temperature: 0.2,
+          system: SYSTEM_PROMPT,
+          tools: [TOOL_DEF, METRICS_TOOL_DEF],
+          messages: convo,
         }),
       });
 
       if (!resp.ok) {
         const detail = await resp.text();
-        console.error("OpenAI error", resp.status, detail.slice(0, 500));
+        console.error("Anthropic error", resp.status, detail.slice(0, 500));
         return res
           .status(502)
           .json({ error: "Model call failed. Try again shortly." });
       }
 
       const data = await resp.json();
-      const msg = data.choices?.[0]?.message;
-      if (!msg) {
+      const content = data.content;
+      if (!Array.isArray(content)) {
         return res.status(502).json({ error: "Empty model response" });
       }
 
-      if (msg.tool_calls?.length && loop < MAX_TOOL_LOOPS) {
-        convo.push(msg);
-        for (const call of msg.tool_calls) {
+      const toolUses = content.filter((b) => b.type === "tool_use");
+      if (toolUses.length && loop < MAX_TOOL_LOOPS) {
+        convo.push({ role: "assistant", content });
+        const results = toolUses.map((block) => {
           let result;
           try {
-            const parsed = JSON.parse(call.function.arguments || "{}");
-            if (call.function.name === "run_fund_metrics") {
-              result = runFundMetrics(parsed);
-            } else if (call.function.name === "run_reserves_check") {
-              result = runReservesCheck(parsed);
-            } else {
-              result = { error: `Unknown tool: ${call.function.name}` };
-            }
+            result = runNamedTool(block.name, block.input);
           } catch (e) {
-            result = { error: `Invalid inputs: ${e.message}` };
+            result = { error: "Invalid inputs: " + e.message };
           }
-          convo.push({
-            role: "tool",
-            tool_call_id: call.id,
+          return {
+            type: "tool_result",
+            tool_use_id: block.id,
             content: JSON.stringify(result),
-          });
-        }
+          };
+        });
+        convo.push({ role: "user", content: results });
         continue;
       }
 
-      return res.status(200).json({ reply: msg.content || "" });
+      return res.status(200).json({ reply: textFromClaude(content) || "" });
     }
     return res.status(502).json({ error: "Tool loop limit reached" });
   } catch (e) {
